@@ -5,8 +5,9 @@ if [[ -z "${LIBPERF_SOURCED}" ]]; then
   local LIBPERF_PATH="$( cd "$(dirname "$0")" ; pwd -P )"
   if [[ -z "${LIBPERF_ENABLED}" ]]; then export LIBPERF_ENABLED=true; fi
   if [[ -z "${LIBPERF_SAMPLE_SIZE}" ]]; then export LIBPERF_SAMPLE_SIZE=30; fi # The rule of thumb in statistics is 30 samples.
-  if [[ -z "${LIBPERF_PERFORMANCE_LOG}" ]]; then export LIBPERF_PERFORMANCE_LOG="${LIBPERF_PATH}/perf_log.csv"; fi
+  if [[ -z "${LIBPERF_PERFORMANCE_LOG}" ]]; then export LIBPERF_PERFORMANCE_LOG="${LIBPERF_PATH}/perf_log"; fi
   if [[ -z "${LIBPERF_QUIET}" ]]; then export LIBPERF_QUIET=false; fi
+  export LIBPERF_LOG_SUFFIX=".csv"
   export LIBPERF_STOPWATCH="$(date +%s%N)"
   export LIBPERF_LAPS=()
 
@@ -35,8 +36,24 @@ if [[ -z "${LIBPERF_SOURCED}" ]]; then
   function libperf_stopwatchLap() {
     LIBPERF_LAPS+=("$(date +%s%N)")
   }
+  
+  # Summarizes the statistics of the lap samples into min, mean, max, and variance.
+  function libperf_statSummarize() {
+    echo "$@" | awk -F ',' '{
+      min = max = sum = $1;       # Initialize to the first value (2nd field)
+      sum2 = $1 * $1              # Running sum of squares
+      for (n=2; n <= NF; n++) {   # Process each value on the line
+        if ($n < min) min = $n    # Current minimum
+        if ($n > max) max = $n    # Current maximum
+        sum += $n;                # Running sum of values
+        sum2 += $n * $n           # Running sum of squares
+      }
+      
+      # min, mean, max, variance
+      printf min "," sum/(NF) "," max "," ((sum*sum) - sum2)/(NF); 
+    }'
+  }
 
-  # Summarizes the statistics of the laps into min, mean, max, and variance.
   function libperf_stopwatchFinish() {
     LIBPERF_LAPS_RESULT=()
     LIBPERF_LAPS_RESULT[1]="$(libperf_calculate "(${LIBPERF_LAPS[1]} - $LIBPERF_STOPWATCH) / 1000000")"
@@ -50,36 +67,27 @@ if [[ -z "${LIBPERF_SOURCED}" ]]; then
     
     LIBPERF_LAPS=()
 
-    echo "${LIBPERF_LAPS_RESULT[@]}" | awk '{
-      min = max = sum = $1;       # Initialize to the first value (2nd field)
-      sum2 = $1 * $1              # Running sum of squares
-      for (n=2; n <= NF; n++) {   # Process each value on the line
-        if ($n < min) min = $n    # Current minimum
-        if ($n > max) max = $n    # Current maximum
-        sum += $n;                # Running sum of values
-        sum2 += $n * $n           # Running sum of squares
-      }
-      
-      # min, mean, max, variance
-      printf min "," sum/(NF) "," max "," ((sum*sum) - sum2)/(NF); 
-    }' && printf ',%s' "${LIBPERF_LAPS_RESULT[@]}"
+    printf '%s' "${LIBPERF_LAPS_RESULT[1]}" && printf ',%s' "${LIBPERF_LAPS_RESULT[@]:1}"
   }
 
   # Clears and sets the header of the CSV log file.
   function libperf_initLog() {
-    printf "name,min,mean,max,variance" > "$LIBPERF_PERFORMANCE_LOG"
-    for i in {1.."${LIBPERF_SAMPLE_SIZE}"}; do;
-      printf ",sample_${i}" >> "$LIBPERF_PERFORMANCE_LOG"
-    done;
-    printf "\n" >> "$LIBPERF_PERFORMANCE_LOG"
+    printf "name,min,mean,max,variance\n" > "${LIBPERF_PERFORMANCE_LOG}${LIBPERF_LOG_SUFFIX}"
+    printf "name,sample\n" > "${LIBPERF_PERFORMANCE_LOG}_samples${LIBPERF_LOG_SUFFIX}"
+    # for i in {1.."${LIBPERF_SAMPLE_SIZE}"}; do;
+      # printf ",sample_${i}" >> "${LIBPERF_PERFORMANCE_LOG}_samples${LIBPERF_LOG_SUFFIX}"
+    # done;
+    # printf "\n" >> "${LIBPERF_PERFORMANCE_LOG}_samples${LIBPERF_LOG_SUFFIX}"
   }
 
   # Checks if the log file exists, and if not, initializes it.
   function libperf_checkLog() {
-    if [[ ! -f "$LIBPERF_PERFORMANCE_LOG" ]]; then
+    if [[ ! -f "${LIBPERF_PERFORMANCE_LOG}${LIBPERF_LOG_SUFFIX}" ]]; then
       libperf_initLog
     fi
   }
+
+  libperf_silent=false
 
   # First argument is the name of the performance test. Everything afterward is
   # executed within the test.
@@ -87,46 +95,51 @@ if [[ -z "${LIBPERF_SOURCED}" ]]; then
     if ("$LIBPERF_ENABLED"); then
       local name="$1"
       shift
-      libperf_stopwatchStart
-      repeat "$LIBPERF_SAMPLE_SIZE"; do;
-        $@
-        libperf_stopwatchLap
-      done;
-      local stats="$(libperf_stopwatchFinish)"
-      if [[ ! "$LIBPERF_QUIET" ]]; then
-        local mean="$(echo $stats | awk -F ',' '{ printf $2 };')"
-        local variance="$(echo $stats | awk  -F ',' '{ printf $4 };')"
-        echo "[$name] mean: $mean ms; variance: $variance ms"
+
+      if ("$libperf_silent"); then
+        libperf_stopwatchStart
+        repeat "$LIBPERF_SAMPLE_SIZE"; do;
+          $@ 2>&1 > /dev/null
+          libperf_stopwatchLap
+        done;
+      else
+        libperf_stopwatchStart
+        repeat "$LIBPERF_SAMPLE_SIZE"; do;
+          $@
+          libperf_stopwatchLap
+        done;
       fi
+
+      local samples="$(libperf_stopwatchFinish)"
+      local summary="$(libperf_statSummarize $samples)"
+      if [[ ! "$LIBPERF_QUIET" ]]; then
+        local mean="$(echo $summary | awk -F ',' '{ printf $2 };')"
+        local variance="$(echo $summary | awk  -F ',' '{ printf $4 };')"
+        local min="$(echo $summary | awk -F ',' '{ printf $1 };')"
+        local max="$(echo $summary | awk  -F ',' '{ printf $3 };')"
+        echo "[$name] mean: $mean ms; variance: $variance ms; min: $min ms; max: $max ms"
+      fi
+
       libperf_checkLog
-      echo "$name,$stats" >> "$LIBPERF_PERFORMANCE_LOG"
+      echo "$name,$summary" >> "${LIBPERF_PERFORMANCE_LOG}${LIBPERF_LOG_SUFFIX}"
+
+      # read -A is a ZSHism (normally read -a).
+      while IFS=',' read -rA sample_list; do
+        for i in "${sample_list[@]}"; do
+          echo "$name,$i" >> "${LIBPERF_PERFORMANCE_LOG}_samples${LIBPERF_LOG_SUFFIX}"
+        done
+      done <<< "$samples"
     fi
   }
 
   # Same as samplePerformance() except with silenced output.
   function samplePerformanceSilent() {
-    if ("$LIBPERF_ENABLED"); then
-      local name="$1"
-      shift
-      libperf_stopwatchStart
-      repeat "$LIBPERF_SAMPLE_SIZE"; do;
-        $@ 2>&1 > /dev/null
-        libperf_stopwatchLap
-      done;
-      local stats="$(libperf_stopwatchFinish)"
-      if [[ ! "$LIBPERF_QUIET" ]]; then
-        local mean="$(echo $stats | awk -F ',' '{ printf $2 };')"
-        local variance="$(echo $stats | awk  -F ',' '{ printf $4 };')"
-        echo "[$name] mean: $mean ms; variance: $variance ms"
-      fi
-      libperf_checkLog
-      echo "$name,$stats" >> "$LIBPERF_PERFORMANCE_LOG"
-    fi
+    libperf_silent=true
+    local name="$1"
+    shift
+    samplePerformance "$name" $@
+    libperf_silent=false
   }
-
-  # if ("$LIBPERF_ENABLED"); then
-    # libperf_initLog
-  # fi
 
   export LIBPERF_SOURCED=true
 else
